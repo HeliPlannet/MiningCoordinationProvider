@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -64,7 +65,9 @@ type ToolCallResult struct {
 	IsError bool          `json:"isError,omitempty"`
 }
 
-// Config holds DB connection settings
+// Config holds the DEFAULT DB connection settings. Any tool call may override
+// the target database / schema, DataGrip-style: one server reaches every
+// database the credentials are granted on.
 type Config struct {
 	Host     string
 	Port     int
@@ -76,35 +79,62 @@ type Config struct {
 }
 
 var (
-	db     *sql.DB
 	appCfg Config
+
+	// pools holds one *sql.DB per (database, search_path) pair, created lazily.
+	pools   = make(map[string]*sql.DB)
+	poolsMu sync.Mutex
 )
+
+// identRe guards database / schema names before they are interpolated into a
+// libpq keyword=value connection string. Anything with a space, quote,
+// backslash or '=' could inject extra connection parameters.
+var identRe = regexp.MustCompile(`^[A-Za-z0-9_$.\-]{1,63}$`)
+
+const dbParamDesc = "Target database on the same PostgreSQL server (e.g. merchant, common, freight_forwarder). Defaults to the configured database. Use list_databases to discover."
 
 var tools = []Tool{
 	{
-		Name:        "list_schemas",
-		Description: "List all schemas in the PostgreSQL database.",
+		Name:        "list_databases",
+		Description: "List every database on the PostgreSQL server that the credentials can connect to, with size and the configured default flagged.",
 		InputSchema: map[string]interface{}{
 			"type":       "object",
 			"properties": map[string]interface{}{},
 		},
 	},
 	{
-		Name:        "list_tables",
-		Description: "List all tables and views in a specified schema (defaults to the configured application schema).",
+		Name:        "list_schemas",
+		Description: "List all schemas in a database (defaults to the configured database).",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
+				"database": map[string]interface{}{
+					"type":        "string",
+					"description": dbParamDesc,
+				},
+			},
+		},
+	},
+	{
+		Name:        "list_tables",
+		Description: "List all tables and views in a schema of a database.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"database": map[string]interface{}{
+					"type":        "string",
+					"description": dbParamDesc,
+				},
 				"schema": map[string]interface{}{
 					"type":        "string",
-					"description": "Schema name to inspect. Defaults to the configured default schema (e.g. freight_forwarder_18).",
+					"description": "Schema name to inspect. Defaults to the configured default schema for the default database, otherwise 'public'.",
 				},
 			},
 		},
 	},
 	{
 		Name:        "describe_table",
-		Description: "Get detailed column definitions and primary keys for a specific table.",
+		Description: "Get column definitions and primary keys for a specific table.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -112,9 +142,13 @@ var tools = []Tool{
 					"type":        "string",
 					"description": "Table name to inspect.",
 				},
+				"database": map[string]interface{}{
+					"type":        "string",
+					"description": dbParamDesc,
+				},
 				"schema": map[string]interface{}{
 					"type":        "string",
-					"description": "Schema containing the table. Defaults to the configured default schema.",
+					"description": "Schema containing the table. Defaults to the configured default schema for the default database, otherwise 'public'.",
 				},
 			},
 			"required": []string{"table"},
@@ -129,6 +163,14 @@ var tools = []Tool{
 				"query": map[string]interface{}{
 					"type":        "string",
 					"description": "The read-only SQL query to execute.",
+				},
+				"database": map[string]interface{}{
+					"type":        "string",
+					"description": dbParamDesc,
+				},
+				"schema": map[string]interface{}{
+					"type":        "string",
+					"description": "Schema to put first on search_path, so unqualified table names resolve there (e.g. merchant_18). Defaults to the configured default schema for the default database, otherwise 'public'.",
 				},
 				"limit": map[string]interface{}{
 					"type":        "integer",
@@ -148,6 +190,14 @@ var tools = []Tool{
 					"type":        "string",
 					"description": "The SQL statement to execute.",
 				},
+				"database": map[string]interface{}{
+					"type":        "string",
+					"description": dbParamDesc,
+				},
+				"schema": map[string]interface{}{
+					"type":        "string",
+					"description": "Schema to put first on search_path. Defaults to the configured default schema for the default database, otherwise 'public'.",
+				},
 			},
 			"required": []string{"query"},
 		},
@@ -155,26 +205,22 @@ var tools = []Tool{
 }
 
 func main() {
-	envFileFlag := flag.String("env-file", "/Users/minhhuy/Repos/A/ff-api/localdev.env", "Path to .env file to load configuration from")
+	envFileFlag := flag.String("env-file", "/Users/minhhuy/Repos/A/MCP/dev-RO-postgres/.env", "Path to .env file to load configuration from")
 	flag.Parse()
 
-	// Load config from env file and OS env
 	loadConfig(*envFileFlag)
 
-	// Connect to Database
-	var err error
-	db, err = connectWithTunnel(appCfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[local-postgres] Warning: Initial DB connection failed: %v\n", err)
+	// Warm the default pool so startup problems surface in stderr immediately,
+	// but never fail hard: other databases may still be reachable.
+	if _, err := getDB(appCfg.Database, appCfg.Schema); err != nil {
+		fmt.Fprintf(os.Stderr, "[dev-RO-postgres] Warning: initial DB connection failed: %v\n", err)
 	} else {
-		defer db.Close()
-		fmt.Fprintf(os.Stderr, "[local-postgres] Connected successfully to %s:%d/%s (schema: %s)\n",
+		fmt.Fprintf(os.Stderr, "[dev-RO-postgres] Connected to %s:%d/%s (schema: %s); any database on this server is reachable via the 'database' tool argument\n",
 			appCfg.Host, appCfg.Port, appCfg.Database, appCfg.Schema)
 	}
+	defer closeAllPools()
 
-	// JSON-RPC stdio loop
 	scanner := bufio.NewScanner(os.Stdin)
-	// Buffer size for large payloads
 	const maxScanCapacity = 10 * 1024 * 1024
 	buf := make([]byte, 64*1024)
 	scanner.Buffer(buf, maxScanCapacity)
@@ -195,7 +241,7 @@ func main() {
 	}
 
 	if err := scanner.Err(); err != nil && err != io.EOF {
-		fmt.Fprintf(os.Stderr, "[local-postgres] Scanner error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[dev-RO-postgres] Scanner error: %v\n", err)
 	}
 }
 
@@ -217,7 +263,7 @@ func loadConfig(envPath string) {
 			}
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "[local-postgres] Note: could not read env file %s: %v\n", envPath, err)
+		fmt.Fprintf(os.Stderr, "[dev-RO-postgres] Note: could not read env file %s: %v\n", envPath, err)
 	}
 
 	getVal := func(key string, def string) string {
@@ -278,6 +324,65 @@ func parseDataSourceURL(rawURL string, cfg *Config) {
 			cfg.Password = pass
 		}
 	}
+}
+
+// resolveTarget picks the database and search_path schema for one tool call.
+func resolveTarget(args map[string]interface{}) (string, string, error) {
+	dbName := appCfg.Database
+	if v, ok := args["database"].(string); ok && strings.TrimSpace(v) != "" {
+		dbName = strings.TrimSpace(v)
+	}
+
+	schema := ""
+	if v, ok := args["schema"].(string); ok && strings.TrimSpace(v) != "" {
+		schema = strings.TrimSpace(v)
+	}
+	if schema == "" {
+		if dbName == appCfg.Database {
+			schema = appCfg.Schema
+		} else {
+			schema = "public"
+		}
+	}
+
+	if !identRe.MatchString(dbName) {
+		return "", "", fmt.Errorf("invalid database name %q", dbName)
+	}
+	if !identRe.MatchString(schema) {
+		return "", "", fmt.Errorf("invalid schema name %q", schema)
+	}
+	return dbName, schema, nil
+}
+
+func poolKey(dbName, schema string) string {
+	return dbName + "\x00" + schema
+}
+
+// getDB returns a pooled connection for (database, schema), opening one on
+// first use. A pool that has gone stale is discarded and reopened.
+func getDB(dbName, schema string) (*sql.DB, error) {
+	key := poolKey(dbName, schema)
+
+	poolsMu.Lock()
+	defer poolsMu.Unlock()
+
+	if d, ok := pools[key]; ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := d.PingContext(ctx)
+		cancel()
+		if err == nil {
+			return d, nil
+		}
+		d.Close()
+		delete(pools, key)
+	}
+
+	d, err := openWithTunnel(dbName, schema)
+	if err != nil {
+		return nil, err
+	}
+	pools[key] = d
+	return d, nil
 }
 
 var (
@@ -350,74 +455,55 @@ func ensureTunnel() error {
 	return fmt.Errorf("ssh tunnel did not open port %d within 15s", tunnelPort)
 }
 
-// connectWithTunnel tries the DB; on failure, starts the tunnel if the port
-// is not listening and retries once before giving up.
-func connectWithTunnel(cfg Config) (*sql.DB, error) {
-	conn, err := connectDB(cfg)
+// openDB dials one (database, search_path) pair. Only the configured tunnel
+// port is used: never fall back to a local DB for the dev read-only server.
+func openDB(dbName, schema string) (*sql.DB, error) {
+	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s connect_timeout=5 search_path=%s,public",
+		appCfg.Host, appCfg.Port, appCfg.User, appCfg.Password, dbName, appCfg.SSLMode, schema)
+
+	testDB, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, err
+	}
+	testDB.SetMaxOpenConns(5)
+	testDB.SetMaxIdleConns(2)
+	testDB.SetConnMaxLifetime(10 * time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err = testDB.PingContext(ctx)
+	cancel()
+	if err != nil {
+		testDB.Close()
+		return nil, fmt.Errorf("could not connect to database %q: %w", dbName, err)
+	}
+	return testDB, nil
+}
+
+// openWithTunnel tries the DB; on failure it starts the ssh tunnel when the
+// port is not listening and retries once before giving up.
+func openWithTunnel(dbName, schema string) (*sql.DB, error) {
+	conn, err := openDB(dbName, schema)
 	if err == nil {
 		return conn, nil
 	}
-	fmt.Fprintf(os.Stderr, "[dev-RO-postgres] Connect failed (%v), checking tunnel\n", err)
+	fmt.Fprintf(os.Stderr, "[dev-RO-postgres] Connect to %q failed (%v), checking tunnel\n", dbName, err)
 	if tErr := ensureTunnel(); tErr != nil {
 		return nil, fmt.Errorf("%v; tunnel: %v", err, tErr)
 	}
-	conn, err2 := connectDB(cfg)
+	conn, err2 := openDB(dbName, schema)
 	if err2 != nil {
-		return nil, fmt.Errorf("reconnect after tunnel check failed: %w", err2)
+		return nil, fmt.Errorf("reconnect to %q after tunnel check failed: %w", dbName, err2)
 	}
 	return conn, nil
 }
 
-func connectDB(cfg Config) (*sql.DB, error) {
-	// Only the configured port: never fall back to a local DB for the dev read-only server
-	portsToTry := []int{cfg.Port}
-
-	var lastErr error
-	for _, p := range portsToTry {
-		connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s connect_timeout=5 search_path=%s,public",
-			cfg.Host, p, cfg.User, cfg.Password, cfg.Database, cfg.SSLMode, cfg.Schema)
-
-		testDB, err := sql.Open("postgres", connStr)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		testDB.SetMaxOpenConns(5)
-		testDB.SetMaxIdleConns(2)
-		testDB.SetConnMaxLifetime(10 * time.Minute)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		err = testDB.PingContext(ctx)
-		cancel()
-
-		if err == nil {
-			appCfg.Port = p
-			return testDB, nil
-		}
-		testDB.Close()
-		lastErr = err
+func closeAllPools() {
+	poolsMu.Lock()
+	defer poolsMu.Unlock()
+	for k, d := range pools {
+		d.Close()
+		delete(pools, k)
 	}
-
-	return nil, lastErr
-}
-
-func ensureDB() error {
-	if db != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		err := db.PingContext(ctx)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		db.Close()
-		db = nil
-	}
-	conn, err := connectWithTunnel(appCfg)
-	if err != nil {
-		return fmt.Errorf("failed to connect to postgres: %w", err)
-	}
-	db = conn
-	return nil
 }
 
 func handleRequest(req *JSONRPCRequest) {
@@ -429,8 +515,8 @@ func handleRequest(req *JSONRPCRequest) {
 				"tools": map[string]interface{}{},
 			},
 			"serverInfo": map[string]interface{}{
-				"name":    "local-postgres",
-				"version": "1.0.0",
+				"name":    "dev-RO-postgres",
+				"version": "2.0.0",
 			},
 		}
 		sendResult(req.ID, result)
@@ -477,29 +563,33 @@ func handleRequest(req *JSONRPCRequest) {
 }
 
 func executeTool(name string, args map[string]interface{}) (string, error) {
-	if err := ensureDB(); err != nil {
+	if args == nil {
+		args = map[string]interface{}{}
+	}
+
+	dbName, schema, err := resolveTarget(args)
+	if err != nil {
+		return "", err
+	}
+
+	conn, err := getDB(dbName, schema)
+	if err != nil {
 		return "", err
 	}
 
 	switch name {
+	case "list_databases":
+		return handleListDatabases(conn)
 	case "list_schemas":
-		return handleListSchemas()
+		return handleListSchemas(conn, dbName)
 	case "list_tables":
-		schema := appCfg.Schema
-		if s, ok := args["schema"].(string); ok && strings.TrimSpace(s) != "" {
-			schema = strings.TrimSpace(s)
-		}
-		return handleListTables(schema)
+		return handleListTables(conn, dbName, schema)
 	case "describe_table":
 		table, _ := args["table"].(string)
 		if strings.TrimSpace(table) == "" {
 			return "", fmt.Errorf("table argument is required")
 		}
-		schema := appCfg.Schema
-		if s, ok := args["schema"].(string); ok && strings.TrimSpace(s) != "" {
-			schema = strings.TrimSpace(s)
-		}
-		return handleDescribeTable(schema, table)
+		return handleDescribeTable(conn, dbName, schema, strings.TrimSpace(table))
 	case "read_query":
 		q, _ := args["query"].(string)
 		if strings.TrimSpace(q) == "" {
@@ -512,20 +602,62 @@ func executeTool(name string, args map[string]interface{}) (string, error) {
 		if limit > 500 {
 			limit = 500
 		}
-		return handleReadQuery(q, limit)
+		return handleReadQuery(conn, dbName, schema, q, limit)
 	case "execute_query":
 		q, _ := args["query"].(string)
 		if strings.TrimSpace(q) == "" {
 			return "", fmt.Errorf("query argument is required")
 		}
-		return handleExecuteQuery(q)
+		return handleExecuteQuery(conn, dbName, schema, q)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
 }
 
-func handleListSchemas() (string, error) {
-	rows, err := db.Query("SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog', 'pg_toast') ORDER BY schema_name")
+func handleListDatabases(conn *sql.DB) (string, error) {
+	rows, err := conn.Query(`
+		SELECT d.datname,
+		       pg_get_userbyid(d.datdba) AS owner,
+		       d.datallowconn,
+		       d.datistemplate,
+		       pg_size_pretty(pg_database_size(d.datname)) AS size
+		FROM pg_database d
+		WHERE d.datallowconn AND NOT d.datistemplate
+		ORDER BY d.datname`)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	type DatabaseItem struct {
+		Name      string `json:"database"`
+		Owner     string `json:"owner"`
+		Size      string `json:"size"`
+		IsDefault bool   `json:"is_default,omitempty"`
+	}
+
+	var dbs []DatabaseItem
+	for rows.Next() {
+		var item DatabaseItem
+		var allowConn, isTemplate bool
+		if err := rows.Scan(&item.Name, &item.Owner, &allowConn, &isTemplate, &item.Size); err == nil {
+			item.IsDefault = item.Name == appCfg.Database
+			dbs = append(dbs, item)
+		}
+	}
+
+	data, _ := json.MarshalIndent(map[string]interface{}{
+		"server":           fmt.Sprintf("%s:%d", appCfg.Host, appCfg.Port),
+		"default_database": appCfg.Database,
+		"count":            len(dbs),
+		"databases":        dbs,
+		"hint":             "Pass any of these names as the 'database' argument to the other tools.",
+	}, "", "  ")
+	return string(data), nil
+}
+
+func handleListSchemas(conn *sql.DB, dbName string) (string, error) {
+	rows, err := conn.Query("SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog', 'pg_toast') AND schema_name NOT LIKE 'pg_temp_%' AND schema_name NOT LIKE 'pg_toast_temp_%' ORDER BY schema_name")
 	if err != nil {
 		return "", err
 	}
@@ -539,14 +671,16 @@ func handleListSchemas() (string, error) {
 		}
 	}
 	data, _ := json.MarshalIndent(map[string]interface{}{
-		"default_schema": appCfg.Schema,
-		"schemas":        schemas,
+		"database":         dbName,
+		"default_database": appCfg.Database,
+		"default_schema":   appCfg.Schema,
+		"schemas":          schemas,
 	}, "", "  ")
 	return string(data), nil
 }
 
-func handleListTables(schema string) (string, error) {
-	rows, err := db.Query(`
+func handleListTables(conn *sql.DB, dbName, schema string) (string, error) {
+	rows, err := conn.Query(`
 		SELECT table_name, table_type 
 		FROM information_schema.tables 
 		WHERE table_schema = $1 
@@ -570,16 +704,16 @@ func handleListTables(schema string) (string, error) {
 	}
 
 	data, _ := json.MarshalIndent(map[string]interface{}{
-		"schema": schema,
-		"count":  len(tables),
-		"tables": tables,
+		"database": dbName,
+		"schema":   schema,
+		"count":    len(tables),
+		"tables":   tables,
 	}, "", "  ")
 	return string(data), nil
 }
 
-func handleDescribeTable(schema, table string) (string, error) {
-	// Query columns
-	colRows, err := db.Query(`
+func handleDescribeTable(conn *sql.DB, dbName, schema, table string) (string, error) {
+	colRows, err := conn.Query(`
 		SELECT column_name, data_type, is_nullable, column_default, character_maximum_length
 		FROM information_schema.columns
 		WHERE table_schema = $1 AND table_name = $2
@@ -616,11 +750,10 @@ func handleDescribeTable(schema, table string) (string, error) {
 	}
 
 	if len(cols) == 0 {
-		return "", fmt.Errorf("table '%s.%s' not found or contains no columns", schema, table)
+		return "", fmt.Errorf("table '%s.%s' not found in database '%s' or contains no columns", schema, table, dbName)
 	}
 
-	// Query primary keys
-	pkRows, err := db.Query(`
+	pkRows, err := conn.Query(`
 		SELECT kcu.column_name
 		FROM information_schema.table_constraints tc
 		JOIN information_schema.key_column_usage kcu
@@ -646,16 +779,16 @@ func handleDescribeTable(schema, table string) (string, error) {
 	}
 
 	data, _ := json.MarshalIndent(map[string]interface{}{
-		"schema":  schema,
-		"table":   table,
-		"columns": cols,
+		"database": dbName,
+		"schema":   schema,
+		"table":    table,
+		"columns":  cols,
 	}, "", "  ")
 	return string(data), nil
 }
 
-func handleReadQuery(q string, limit int) (string, error) {
+func handleReadQuery(conn *sql.DB, dbName, schema, q string, limit int) (string, error) {
 	trimmed := strings.TrimSpace(strings.ToUpper(q))
-	// Prevent destructive queries in read_query
 	destructiveKeywords := []string{"INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "ALTER", "CREATE", "GRANT", "REVOKE"}
 	for _, kw := range destructiveKeywords {
 		pattern := `\b` + kw + `\b`
@@ -665,7 +798,6 @@ func handleReadQuery(q string, limit int) (string, error) {
 		}
 	}
 
-	// Check if query has LIMIT, if not, append or wrap with limit
 	finalQuery := q
 	if !strings.Contains(trimmed, "LIMIT") && !strings.HasPrefix(trimmed, "EXPLAIN") && !strings.HasPrefix(trimmed, "SHOW") {
 		finalQuery = fmt.Sprintf("SELECT * FROM (%s) AS _subq LIMIT %d", strings.TrimSuffix(q, ";"), limit)
@@ -674,7 +806,7 @@ func handleReadQuery(q string, limit int) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	rows, err := db.QueryContext(ctx, finalQuery)
+	rows, err := conn.QueryContext(ctx, finalQuery)
 	if err != nil {
 		return "", err
 	}
@@ -701,7 +833,6 @@ func handleReadQuery(q string, limit int) (string, error) {
 		for i, col := range cols {
 			val := values[i]
 			if b, ok := val.([]byte); ok {
-				// Try parsing as JSON or convert to string
 				var jsonVal interface{}
 				if err := json.Unmarshal(b, &jsonVal); err == nil {
 					rowMap[col] = jsonVal
@@ -716,6 +847,8 @@ func handleReadQuery(q string, limit int) (string, error) {
 	}
 
 	resMap := map[string]interface{}{
+		"database":  dbName,
+		"schema":    schema,
 		"query":     q,
 		"row_count": len(results),
 		"rows":      results,
@@ -724,11 +857,11 @@ func handleReadQuery(q string, limit int) (string, error) {
 	return string(data), nil
 }
 
-func handleExecuteQuery(q string) (string, error) {
+func handleExecuteQuery(conn *sql.DB, dbName, schema, q string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	res, err := db.ExecContext(ctx, q)
+	res, err := conn.ExecContext(ctx, q)
 	if err != nil {
 		return "", err
 	}
@@ -736,6 +869,8 @@ func handleExecuteQuery(q string) (string, error) {
 	rowsAffected, _ := res.RowsAffected()
 	data, _ := json.MarshalIndent(map[string]interface{}{
 		"status":        "success",
+		"database":      dbName,
+		"schema":        schema,
 		"rows_affected": rowsAffected,
 	}, "", "  ")
 	return string(data), nil
